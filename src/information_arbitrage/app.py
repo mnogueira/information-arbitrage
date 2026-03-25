@@ -14,7 +14,7 @@ from information_arbitrage.execution.ib import IBDataClient, IBExecClient
 from information_arbitrage.execution.mt5 import MT5Client
 from information_arbitrage.execution.router import ExecutionRouter
 from information_arbitrage.instruments.registry import InstrumentRegistry
-from information_arbitrage.models import HeadlineEvent
+from information_arbitrage.models import ExecutionReport, HeadlineEvent
 from information_arbitrage.monitor.storage import MarketStore
 from information_arbitrage.monitor.telegram import TelegramNotifier
 from information_arbitrage.scoring.engine import HeadlineScoringEngine
@@ -148,9 +148,21 @@ class TraderService:
                 instrument = self.registry.resolve(decision.symbol)
                 if instrument is None:
                     continue
-                report = await self.router.execute(decision, instrument)
-                self.store.record_execution(report)
-                if decision.confidence >= max(0.75, self.settings.confidence_threshold):
+                if decision.metadata.get("shadow"):
+                    report = ExecutionReport(
+                        decision_id=decision.id,
+                        symbol=decision.symbol,
+                        broker=decision.broker,
+                        status="shadow",
+                        filled_quantity=0.0,
+                        average_fill_price=decision.reference_price,
+                        metadata={"shadow": True},
+                    )
+                else:
+                    report = await self.router.execute(decision, instrument)
+                    self.store.record_execution(report)
+                self.store.record_trade(decision, report)
+                if not decision.metadata.get("shadow") and decision.confidence >= max(0.75, self.settings.confidence_threshold):
                     await self.notifier.notify_trade(decision, report)
 
             self.store.mark_headline_processed(headline.id)

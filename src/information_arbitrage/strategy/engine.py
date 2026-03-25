@@ -69,7 +69,7 @@ class StrategyEngine:
                 continue
 
             price_assessment = self._assess_price_action(instrument, signal.direction)
-            if not price_assessment.ready or price_assessment.skip:
+            if not price_assessment.ready:
                 continue
 
             contracts = confidence_contracts(signal.confidence)
@@ -80,8 +80,66 @@ class StrategyEngine:
             )
             if confirmations > 0:
                 contracts = min(3, contracts + 1)
-            if price_assessment.reduce:
+            contrarian_ready = self._should_run_contrarian(score, price_assessment)
+            if price_assessment.reduce and not contrarian_ready:
                 contracts = max(1, contracts - 1)
+
+            if contrarian_ready:
+                decisions.append(
+                    self._build_decision(
+                        headline=headline,
+                        score=score,
+                        instrument=instrument,
+                        direction=self._opposite_direction(signal.direction),
+                        confidence=signal.confidence,
+                        urgency=effective_urgency,
+                        contracts=contracts,
+                        price_assessment=price_assessment,
+                        strategy_type="contrarian",
+                        strategy_name="contrarian-fade",
+                        reason_suffix=(
+                            f"extreme-dj-sentiment={score.metadata.get('native_sentiment')}; "
+                            f"crowded-move={price_assessment.directional_move}; confirmations={confirmations}"
+                        ),
+                        extra_metadata={
+                            "shadow": False,
+                            "native_sentiment": score.metadata.get("native_sentiment"),
+                            "native_confidence": score.metadata.get("native_confidence"),
+                            "crowded_move_threshold": 0.02,
+                        },
+                        evaluation_time=evaluation_time,
+                    )
+                )
+                planned_symbols.add((instrument.broker.value, instrument.symbol))
+                decisions.append(
+                    self._build_decision(
+                        headline=headline,
+                        score=score,
+                        instrument=instrument,
+                        direction=signal.direction,
+                        confidence=signal.confidence,
+                        urgency=effective_urgency,
+                        contracts=contracts,
+                        price_assessment=price_assessment,
+                        strategy_type="momentum",
+                        strategy_name=self._select_strategy(headline, instrument.symbol),
+                        reason_suffix=(
+                            f"shadow-benchmark extreme-dj-sentiment={score.metadata.get('native_sentiment')}; "
+                            f"crowded-move={price_assessment.directional_move}; confirmations={confirmations}"
+                        ),
+                        extra_metadata={
+                            "shadow": True,
+                            "native_sentiment": score.metadata.get("native_sentiment"),
+                            "native_confidence": score.metadata.get("native_confidence"),
+                            "crowded_move_threshold": 0.02,
+                        },
+                        evaluation_time=evaluation_time,
+                    )
+                )
+                continue
+
+            if price_assessment.skip:
+                continue
 
             decisions.append(
                 self._build_decision(
@@ -93,7 +151,9 @@ class StrategyEngine:
                     urgency=effective_urgency,
                     contracts=contracts,
                     price_assessment=price_assessment,
+                    strategy_type="momentum",
                     reason_suffix=f"confirmations={confirmations}",
+                    extra_metadata={"shadow": False},
                     evaluation_time=evaluation_time,
                 )
             )
@@ -118,8 +178,10 @@ class StrategyEngine:
                         urgency=effective_urgency,
                         contracts=max(1, contracts - 1),
                         price_assessment=related_price,
+                        strategy_type="momentum",
                         strategy_name="pairs-arbitrage",
                         reason_suffix=f"paired-with={instrument.symbol}",
+                        extra_metadata={"shadow": False},
                         evaluation_time=evaluation_time,
                     )
                 )
@@ -156,8 +218,16 @@ class StrategyEngine:
         return self.registry.related(symbol)[:1]
 
     def _adjust_urgency(self, urgency: Urgency, headline: HeadlineEvent) -> Urgency:
-        if headline.source_kind == "ib_news" and (headline.provider or "").upper().startswith("DJ"):
+        provider = (headline.provider or "").upper()
+        symbols = {symbol.upper() for symbol in headline.symbols}
+        if headline.source_kind == "ib_news" and provider.startswith("DJ"):
             return Urgency.CRITICAL
+        if headline.source_kind == "ib_news" and provider in {"BZ", "BRFG", "BRFUPDN"}:
+            if symbols and symbols.isdisjoint({"CL", "BRN", "BZ", "GC", "EURUSD", "USDJPY"}):
+                return Urgency.CRITICAL
+            if urgency in {Urgency.LOW, Urgency.MEDIUM}:
+                return Urgency.HIGH
+            return urgency
         if headline.source_kind == "rss":
             return {
                 Urgency.CRITICAL: Urgency.HIGH,
@@ -184,8 +254,10 @@ class StrategyEngine:
         contracts: int,
         price_assessment,
         evaluation_time: datetime,
+        strategy_type: str = "momentum",
         strategy_name: str | None = None,
         reason_suffix: str | None = None,
+        extra_metadata: dict | None = None,
     ) -> TradeDecision:
         age_seconds = max(0.0, (evaluation_time - headline.published_at).total_seconds())
         strategy = strategy_name or self._select_strategy(headline, instrument.symbol)
@@ -200,6 +272,10 @@ class StrategyEngine:
         )
         return TradeDecision(
             headline_id=headline.id,
+            news_source=self._format_news_source(headline),
+            headline_text=headline.text,
+            headline_timestamp=headline.published_at,
+            score=score.escalation_score,
             symbol=instrument.symbol,
             broker=instrument.broker,
             direction=direction,
@@ -207,6 +283,7 @@ class StrategyEngine:
             confidence=confidence,
             urgency=urgency,
             time_horizon=score.time_horizon,
+            strategy_type=strategy_type,
             strategy_name=strategy,
             reason=reason,
             reference_price=price_assessment.current_price,
@@ -218,13 +295,19 @@ class StrategyEngine:
                 "age_seconds": age_seconds,
                 "speed_window": age_seconds <= 30.0,
                 "headline_source": headline.source,
+                "headline_provider": headline.provider,
+                "headline_provider_name": headline.metadata.get("provider_name"),
                 "headline_kind": headline.source_kind,
+                "news_source": self._format_news_source(headline),
                 "category": score.category.value,
                 "contracts": contracts,
                 "price_reference_symbol": price_assessment.reference_symbol,
                 "price_5m_ago": price_assessment.price_5m_ago,
                 "directional_move_5m": price_assessment.directional_move,
                 "price_assessment": price_assessment.reason,
+                "source_priority": headline.metadata.get("source_priority", 0.0),
+                "decision_latency_seconds": age_seconds,
+                **(extra_metadata or {}),
             },
         )
 
@@ -248,3 +331,23 @@ class StrategyEngine:
     @staticmethod
     def _normalize_text(text: str) -> str:
         return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", text.lower())).strip()
+
+    @staticmethod
+    def _format_news_source(headline: HeadlineEvent) -> str:
+        provider = headline.provider or headline.source
+        provider_name = headline.metadata.get("provider_name")
+        if provider_name and provider_name != provider:
+            return f"{provider} ({provider_name})"
+        return provider
+
+    @staticmethod
+    def _should_run_contrarian(score: ScoredHeadline, price_assessment) -> bool:
+        if score.metadata.get("engine") != "dj-native":
+            return False
+        native_sentiment = float(score.metadata.get("native_sentiment", 0.0))
+        crowded_move = price_assessment.directional_move or 0.0
+        return abs(native_sentiment) >= 0.8 and crowded_move >= 0.02
+
+    @staticmethod
+    def _opposite_direction(direction: Direction) -> Direction:
+        return Direction.SHORT if direction == Direction.LONG else Direction.LONG

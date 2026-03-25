@@ -14,6 +14,13 @@ def headline_dedupe_key(text: str) -> str:
     return sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def scoped_headline_dedupe_key(text: str, *scope_parts: str | None) -> str:
+    normalized = " ".join(text.lower().strip().split())
+    scope = "|".join(part.strip().lower() for part in scope_parts if part)
+    payload = f"{scope}|{normalized}" if scope else normalized
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
 class Broker(StrEnum):
     IB = "ib"
     MT5 = "mt5"
@@ -133,6 +140,10 @@ class PositionExposure(BaseModel):
 class TradeDecision(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     headline_id: str
+    news_source: str | None = None
+    headline_text: str | None = None
+    headline_timestamp: datetime | None = None
+    score: float | None = None
     symbol: str
     broker: Broker
     direction: Direction
@@ -140,6 +151,7 @@ class TradeDecision(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     urgency: Urgency
     time_horizon: TimeHorizon
+    strategy_type: str = "momentum"
     strategy_name: str
     reason: str
     order_type: str = "market"

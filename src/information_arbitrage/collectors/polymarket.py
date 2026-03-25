@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 import requests
 
 from information_arbitrage.collectors.base import BaseCollector
-from information_arbitrage.models import HeadlineEvent
+from information_arbitrage.models import HeadlineEvent, scoped_headline_dedupe_key
 
 
 class PolymarketCollector(BaseCollector):
@@ -56,7 +56,11 @@ class PolymarketCollector(BaseCollector):
                         "current_probability": price,
                         "delta_probability": delta,
                         "slug": market.get("slug"),
+                        "source_priority": 0.45,
+                        "provider_name": "Polymarket Gamma API",
+                        "provider_family": "prediction-market",
                     },
+                    dedupe_key=scoped_headline_dedupe_key(question, self.source_kind, market_id),
                 )
             )
         return headlines

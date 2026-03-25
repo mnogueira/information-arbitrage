@@ -29,12 +29,16 @@ DEFAULT_POLYMARKET_KEYWORDS = [
 ]
 
 DEFAULT_IB_NEWS_PROVIDERS = [
+    "BZ",
+    "BRFG",
+    "BRFUPDN",
+    "DJ-GM",
+    "DJ-N",
     "DJ-RT",
     "DJ-RTG",
     "DJ-RTE",
     "DJ-RTA",
-    "BRFG",
-    "BRFUPDN",
+    "DJNL",
 ]
 
 

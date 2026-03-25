@@ -27,6 +27,7 @@ class MarketStore:
                     source VARCHAR NOT NULL,
                     source_kind VARCHAR NOT NULL,
                     provider VARCHAR,
+                    source_priority DOUBLE NOT NULL DEFAULT 0.0,
                     text VARCHAR NOT NULL,
                     url VARCHAR,
                     article_id VARCHAR,
@@ -62,6 +63,11 @@ class MarketStore:
                 CREATE TABLE IF NOT EXISTS trade_decisions (
                     id VARCHAR PRIMARY KEY,
                     headline_id VARCHAR NOT NULL,
+                    news_source VARCHAR,
+                    headline_text VARCHAR,
+                    headline_timestamp TIMESTAMP,
+                    score DOUBLE,
+                    strategy_type VARCHAR NOT NULL DEFAULT 'momentum',
                     symbol VARCHAR NOT NULL,
                     broker VARCHAR NOT NULL,
                     direction VARCHAR NOT NULL,
@@ -73,6 +79,27 @@ class MarketStore:
                     reason VARCHAR NOT NULL,
                     metadata_json VARCHAR NOT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trades (
+                    decision_id VARCHAR PRIMARY KEY,
+                    headline_id VARCHAR NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    broker VARCHAR NOT NULL,
+                    news_source VARCHAR NOT NULL,
+                    headline_text VARCHAR NOT NULL,
+                    headline_timestamp TIMESTAMP NOT NULL,
+                    score DOUBLE,
+                    confidence DOUBLE NOT NULL,
+                    strategy_type VARCHAR NOT NULL,
+                    trade_timestamp TIMESTAMP NOT NULL,
+                    latency_seconds DOUBLE NOT NULL,
+                    status VARCHAR NOT NULL,
+                    strategy_name VARCHAR NOT NULL,
+                    metadata_json VARCHAR NOT NULL
                 )
                 """
             )
@@ -91,6 +118,13 @@ class MarketStore:
                 )
                 """
             )
+            self._conn.execute("ALTER TABLE headlines ADD COLUMN IF NOT EXISTS source_priority DOUBLE DEFAULT 0.0")
+            self._conn.execute("ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS news_source VARCHAR")
+            self._conn.execute("ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS headline_text VARCHAR")
+            self._conn.execute("ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS headline_timestamp TIMESTAMP")
+            self._conn.execute("ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS score DOUBLE")
+            self._conn.execute("ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS strategy_type VARCHAR DEFAULT 'momentum'")
+            self._conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_type VARCHAR DEFAULT 'momentum'")
 
     def insert_headline(self, headline: HeadlineEvent) -> bool:
         payload = headline.model_dump(mode="json")
@@ -104,10 +138,10 @@ class MarketStore:
             self._conn.execute(
                 """
                 INSERT INTO headlines (
-                    id, dedupe_key, source, source_kind, provider, text, url, article_id,
+                    id, dedupe_key, source, source_kind, provider, source_priority, text, url, article_id,
                     body, symbols_json, metadata_json, published_at, status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
                 """,
                 [
                     headline.id,
@@ -115,6 +149,7 @@ class MarketStore:
                     headline.source,
                     headline.source_kind,
                     headline.provider,
+                    float(headline.metadata.get("source_priority", 0.0)),
                     headline.text,
                     headline.url,
                     headline.article_id,
@@ -133,7 +168,7 @@ class MarketStore:
                 SELECT id
                 FROM headlines
                 WHERE status = 'pending'
-                ORDER BY published_at ASC
+                ORDER BY source_priority DESC, published_at DESC
                 LIMIT ?
                 """,
                 [limit],
@@ -221,36 +256,42 @@ class MarketStore:
                 self._conn.execute(
                     """
                     INSERT OR REPLACE INTO trade_decisions (
-                        id, headline_id, symbol, broker, direction, quantity, confidence,
+                        id, headline_id, news_source, headline_text, headline_timestamp, score, strategy_type,
+                        symbol, broker, direction, quantity, confidence,
                         urgency, time_horizon, strategy_name, reason, metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         decision.id,
                         decision.headline_id,
+                        decision.news_source,
+                        decision.headline_text,
+                        decision.headline_timestamp,
+                        decision.score,
+                        decision.strategy_type,
                         decision.symbol,
                         decision.broker.value,
                         decision.direction.value,
                         decision.quantity,
                         decision.confidence,
                         decision.urgency.value,
-                    decision.time_horizon.value,
-                    decision.strategy_name,
-                    decision.reason,
-                    json.dumps(
-                        {
-                            **decision.metadata,
-                            "order_type": decision.order_type,
-                            "reference_price": decision.reference_price,
-                            "atr": decision.atr,
-                            "stop_loss": decision.stop_loss,
-                            "take_profit": decision.take_profit,
-                            "time_exit_at": decision.time_exit_at.isoformat()
-                            if decision.time_exit_at
-                            else None,
-                        }
-                    ),
+                        decision.time_horizon.value,
+                        decision.strategy_name,
+                        decision.reason,
+                        json.dumps(
+                            {
+                                **decision.metadata,
+                                "order_type": decision.order_type,
+                                "reference_price": decision.reference_price,
+                                "atr": decision.atr,
+                                "stop_loss": decision.stop_loss,
+                                "take_profit": decision.take_profit,
+                                "time_exit_at": decision.time_exit_at.isoformat()
+                                if decision.time_exit_at
+                                else None,
+                            }
+                        ),
                     ],
                 )
 
@@ -274,6 +315,46 @@ class MarketStore:
                     report.average_fill_price,
                     report.executed_at,
                     json.dumps(report.metadata),
+                ],
+            )
+
+    def record_trade(self, decision: TradeDecision, report: ExecutionReport) -> None:
+        headline_timestamp = decision.headline_timestamp or report.executed_at
+        latency_seconds = max(0.0, (report.executed_at - headline_timestamp).total_seconds())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO trades (
+                    decision_id, headline_id, symbol, broker, news_source, headline_text,
+                    headline_timestamp, score, confidence, strategy_type, trade_timestamp, latency_seconds,
+                    status, strategy_name, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    decision.id,
+                    decision.headline_id,
+                    decision.symbol,
+                    decision.broker.value,
+                    decision.news_source or decision.metadata.get("news_source") or "unknown",
+                    decision.headline_text or "",
+                    headline_timestamp,
+                    decision.score,
+                    decision.confidence,
+                    decision.strategy_type,
+                    report.executed_at,
+                    latency_seconds,
+                    report.status,
+                    decision.strategy_name,
+                    json.dumps(
+                        {
+                            **decision.metadata,
+                            **report.metadata,
+                            "broker_order_id": report.broker_order_id,
+                            "filled_quantity": report.filled_quantity,
+                            "average_fill_price": report.average_fill_price,
+                        }
+                    ),
                 ],
             )
 
@@ -301,6 +382,17 @@ class MarketStore:
                 LEFT JOIN executions e ON e.decision_id = d.id
                 GROUP BY 1
                 ORDER BY headlines DESC, executions DESC
+                """
+            ).fetchall()
+
+    def trade_source_performance(self) -> list[tuple[str, int, float]]:
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT news_source, COUNT(*) AS trades, AVG(latency_seconds) AS avg_latency_seconds
+                FROM trades
+                GROUP BY 1
+                ORDER BY trades DESC, avg_latency_seconds ASC
                 """
             ).fetchall()
 

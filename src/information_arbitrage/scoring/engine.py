@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from information_arbitrage.config import Settings
 from information_arbitrage.instruments.registry import InstrumentRegistry
@@ -18,6 +19,9 @@ from information_arbitrage.models import (
 )
 
 logger = logging.getLogger(__name__)
+DJ_SENTIMENT_PATTERN = re.compile(
+    r"\{A:(?P<asset_id>[^:}]+):L:(?P<language>[^:}]+):K:(?P<score>[-+]?\d*\.?\d+):C:(?P<confidence>[-+]?\d*\.?\d+)\}"
+)
 
 try:
     from openai import AsyncOpenAI
@@ -108,6 +112,16 @@ class HeadlineScoringEngine:
         )
 
     async def score(self, headline: HeadlineEvent) -> ScoredHeadline:
+        native_score = self._score_from_native_dj_sentiment(headline)
+        if native_score is not None:
+            return native_score
+
+        if not self._should_use_llm(headline):
+            fallback = self._fallback.score(headline)
+            fallback.metadata["llm_skipped"] = True
+            fallback.metadata["skip_reason"] = "ib-news-without-native-dj-score"
+            return fallback
+
         if self._client is None:
             return self._fallback.score(headline)
 
@@ -144,6 +158,98 @@ class HeadlineScoringEngine:
             fallback.metadata["openai_error"] = True
             fallback.metadata["requested_model"] = self.settings.openai_model
             return fallback
+
+    def _score_from_native_dj_sentiment(self, headline: HeadlineEvent) -> ScoredHeadline | None:
+        if headline.source_kind != "ib_news":
+            return None
+        provider = (headline.provider or "").upper()
+        if not provider.startswith("DJ"):
+            return None
+
+        match = self._extract_native_sentiment(headline)
+        if match is None:
+            return None
+
+        fallback = self._fallback.score(headline)
+        sentiment = float(match["score"])
+        native_confidence = float(match["confidence"])
+        direction = Direction.LONG if sentiment >= 0 else Direction.SHORT
+        signal_confidence = max(0.6, min(1.0, (abs(sentiment) * 0.7) + (native_confidence * 0.3)))
+
+        instruments = self._native_instruments(headline, fallback, direction, signal_confidence)
+        urgency = (
+            Urgency.CRITICAL
+            if abs(sentiment) >= 0.8
+            else Urgency.HIGH
+            if abs(sentiment) >= 0.5
+            else fallback.urgency
+        )
+        return ScoredHeadline(
+            headline_id=headline.id,
+            model="dj-native",
+            instruments=instruments,
+            escalation_score=sentiment,
+            category=fallback.category,
+            urgency=urgency,
+            time_horizon=TimeHorizon.MINUTES if abs(sentiment) >= 0.5 else fallback.time_horizon,
+            metadata={
+                "engine": "dj-native",
+                "llm_skipped": True,
+                "native_asset_id": match["asset_id"],
+                "native_language": match["language"],
+                "native_sentiment": sentiment,
+                "native_confidence": native_confidence,
+                "provider": provider,
+            },
+        )
+
+    def _native_instruments(
+        self,
+        headline: HeadlineEvent,
+        fallback: ScoredHeadline,
+        direction: Direction,
+        confidence: float,
+    ) -> list[InstrumentSignal]:
+        resolved: dict[str, InstrumentSignal] = {}
+        candidate_symbols = [*headline.symbols]
+        native_match = self._extract_native_sentiment(headline)
+        if native_match is not None:
+            candidate_symbols.append(native_match["asset_id"])
+
+        for candidate in candidate_symbols:
+            instrument = self.registry.resolve(candidate)
+            if instrument is None:
+                continue
+            resolved[instrument.symbol] = InstrumentSignal(
+                symbol=instrument.symbol,
+                direction=direction,
+                confidence=confidence,
+                broker=instrument.broker,
+            )
+
+        if not resolved:
+            for signal in fallback.instruments:
+                resolved[signal.symbol] = signal.model_copy(update={"direction": direction, "confidence": confidence})
+
+        return list(resolved.values())
+
+    @staticmethod
+    def _extract_native_sentiment(headline: HeadlineEvent) -> dict[str, str] | None:
+        candidates = [
+            headline.text,
+            headline.body or "",
+            json.dumps(headline.metadata, ensure_ascii=True, sort_keys=True),
+        ]
+        for candidate in candidates:
+            match = DJ_SENTIMENT_PATTERN.search(candidate)
+            if match is not None:
+                return match.groupdict()
+        return None
+
+    @staticmethod
+    def _should_use_llm(headline: HeadlineEvent) -> bool:
+        provider = (headline.provider or "").upper()
+        return headline.source_kind == "rss" or provider in {"BZ", "BRFG", "BRFUPDN"}
 
     def _system_prompt(self) -> str:
         return (

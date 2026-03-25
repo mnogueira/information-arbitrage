@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - optional dependency
     feedparser = None
 
 from information_arbitrage.collectors.base import BaseCollector
-from information_arbitrage.models import HeadlineEvent
+from information_arbitrage.models import HeadlineEvent, scoped_headline_dedupe_key
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,13 @@ class RSSCollector(BaseCollector):
                         text=title,
                         url=entry.get("link"),
                         published_at=self._entry_timestamp(entry),
-                        metadata={"feed_url": feed_url},
+                        metadata={
+                            "feed_url": feed_url,
+                            "source_priority": 0.2,
+                            "provider_name": source_name,
+                            "provider_family": "rss",
+                        },
+                        dedupe_key=scoped_headline_dedupe_key(title, self.source_kind, urlparse(feed_url).netloc),
                     )
                 )
         return headlines
