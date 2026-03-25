@@ -6,48 +6,39 @@ from datetime import UTC, datetime
 
 from information_arbitrage.config import Settings
 from information_arbitrage.execution.base import BrokerClient
-from information_arbitrage.models import (
-    Broker,
-    Direction,
-    ExecutionReport,
-    InstrumentDefinition,
-    PositionExposure,
-    TradeDecision,
-)
+from information_arbitrage.models import Broker, Direction, ExecutionReport, InstrumentDefinition, PositionExposure, TradeDecision
 
 logger = logging.getLogger(__name__)
 
 try:
     import MetaTrader5 as mt5
-except ImportError:  # pragma: no cover - depends on optional native install
+except ImportError:  # pragma: no cover - optional native dependency
     mt5 = None
 
 
 class MT5Client(BrokerClient):
-    broker = Broker.MT5
-
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._connected = False
 
     async def connect(self) -> None:
         if mt5 is None:
-            logger.warning("MetaTrader5 package is not installed; MT5 execution will run in simulated mode")
+            logger.warning("MetaTrader5 package unavailable; MT5 disabled")
             return
         if self._connected:
             return
         if not self.settings.mt5_password:
-            logger.warning("MT5_PASSWORD is not set; MT5 execution will run in simulated mode")
+            logger.warning("MT5 password missing; MT5 disabled until market open credentials are available")
             return
-
-        initialized = await asyncio.to_thread(
-            mt5.initialize,
-            path=self.settings.mt5_path,
-            login=self.settings.mt5_login,
-            password=self.settings.mt5_password,
-            server=self.settings.mt5_server,
+        self._connected = bool(
+            await asyncio.to_thread(
+                mt5.initialize,
+                path=self.settings.mt5_path,
+                login=self.settings.mt5_login,
+                password=self.settings.mt5_password,
+                server=self.settings.mt5_server,
+            )
         )
-        self._connected = bool(initialized)
         if not self._connected:
             logger.warning("MT5 initialize failed: %s", mt5.last_error())
 
@@ -61,29 +52,35 @@ class MT5Client(BrokerClient):
         if mt5 is None or not self._connected:
             return []
         rows = await asyncio.to_thread(mt5.positions_get)
-        exposures: list[PositionExposure] = []
+        positions: list[PositionExposure] = []
         for row in rows or []:
             volume = float(getattr(row, "volume", 0.0))
-            order_type = getattr(row, "type", None)
-            quantity = volume if order_type == getattr(mt5, "POSITION_TYPE_BUY", 0) else -volume
-            exposures.append(
+            direction = 1.0 if getattr(row, "type", 0) == getattr(mt5, "POSITION_TYPE_BUY", 0) else -1.0
+            positions.append(
                 PositionExposure(
                     symbol=str(getattr(row, "symbol", "")),
-                    broker=self.broker,
-                    quantity=quantity,
+                    broker=Broker.MT5,
+                    quantity=direction * volume,
                 )
             )
-        return exposures
+        return positions
 
-    async def place_order(
-        self,
-        decision: TradeDecision,
-        instrument: InstrumentDefinition,
-    ) -> ExecutionReport:
+    async def get_account_equity(self) -> float | None:
+        if mt5 is None or not self._connected:
+            return None
+        info = await asyncio.to_thread(mt5.account_info)
+        return float(getattr(info, "equity", 0.0)) if info else None
+
+    async def get_daily_pnl(self) -> float:
+        if mt5 is None or not self._connected:
+            return 0.0
+        info = await asyncio.to_thread(mt5.account_info)
+        return float(getattr(info, "profit", 0.0)) if info else 0.0
+
+    async def place_order(self, decision: TradeDecision, instrument: InstrumentDefinition) -> ExecutionReport:
         symbol = instrument.mt5_symbol or instrument.symbol
         if self.settings.simulate_only or mt5 is None or not self._connected:
-            reason = "simulate-only" if self.settings.simulate_only else "mt5-unavailable"
-            return self._simulated_report(decision, symbol, reason)
+            return self._simulated_report(decision, symbol, "mt5-unavailable")
 
         await asyncio.to_thread(mt5.symbol_select, symbol, True)
         tick = await asyncio.to_thread(mt5.symbol_info_tick, symbol)
@@ -104,27 +101,27 @@ class MT5Client(BrokerClient):
         }
         result = await asyncio.to_thread(mt5.order_send, request)
         retcode = getattr(result, "retcode", None)
-        order_id = getattr(result, "order", None)
         status = "submitted" if retcode == getattr(mt5, "TRADE_RETCODE_DONE", None) else f"mt5-retcode-{retcode}"
         return ExecutionReport(
             decision_id=decision.id,
             symbol=symbol,
-            broker=self.broker,
+            broker=Broker.MT5,
             status=status,
-            broker_order_id=str(order_id) if order_id is not None else None,
+            broker_order_id=str(getattr(result, "order", None)) if getattr(result, "order", None) is not None else None,
             filled_quantity=decision.quantity if status == "submitted" else 0.0,
             average_fill_price=float(price),
             metadata={"retcode": retcode},
         )
 
-    def _simulated_report(self, decision: TradeDecision, symbol: str, reason: str) -> ExecutionReport:
+    @staticmethod
+    def _simulated_report(decision: TradeDecision, symbol: str, reason: str) -> ExecutionReport:
         return ExecutionReport(
             decision_id=decision.id,
             symbol=symbol,
-            broker=self.broker,
+            broker=Broker.MT5,
             status=reason,
             broker_order_id=f"SIM-MT5-{decision.id[:8]}",
             filled_quantity=decision.quantity,
-            executed_at=datetime.now(UTC),
+            average_fill_price=decision.reference_price,
             metadata={"mode": reason},
         )

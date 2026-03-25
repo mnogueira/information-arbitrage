@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -222,12 +222,12 @@ class MarketStore:
                     """
                     INSERT OR REPLACE INTO trade_decisions (
                         id, headline_id, symbol, broker, direction, quantity, confidence,
-                    urgency, time_horizon, strategy_name, reason, metadata_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    decision.id,
+                        urgency, time_horizon, strategy_name, reason, metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        decision.id,
                         decision.headline_id,
                         decision.symbol,
                         decision.broker.value,
@@ -251,8 +251,8 @@ class MarketStore:
                             else None,
                         }
                     ),
-                ],
-            )
+                    ],
+                )
 
     def record_execution(self, report: ExecutionReport) -> None:
         with self._lock:

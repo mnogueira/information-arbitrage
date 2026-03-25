@@ -17,7 +17,7 @@ class BaseCollector(ABC):
         self.name = name
         self.source_kind = source_kind
         self.poll_interval_seconds = poll_interval_seconds
-        self._seen_dedupe_keys: set[str] = set()
+        self._seen_keys: set[str] = set()
 
     async def start(self) -> None:
         return None
@@ -38,11 +38,11 @@ class BaseCollector(ABC):
                 except Exception:
                     logger.exception("Collector %s failed during collection cycle", self.name)
                     headlines = []
-
                 for headline in headlines:
-                    if headline.dedupe_key in self._seen_dedupe_keys:
+                    dedupe_key = headline.dedupe_key or headline.id
+                    if dedupe_key in self._seen_keys:
                         continue
-                    self._seen_dedupe_keys.add(headline.dedupe_key or headline.id)
+                    self._seen_keys.add(dedupe_key)
                     await publish(headline)
 
                 if self.poll_interval_seconds is None:

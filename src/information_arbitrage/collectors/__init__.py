@@ -1,1 +1,1 @@
-"""News and market collectors."""
+"""Collectors for external news and market-implied signals."""
