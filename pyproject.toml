@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "information-arbitrage"
+version = "0.1.0"
+description = "Unified news-driven trading intelligence platform for paper execution across IB and MT5."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [
+  { name = "OpenAI Codex" }
+]
+dependencies = [
+  "duckdb>=1.2.1",
+  "feedparser>=6.0.11",
+  "ib_async>=2.1.0",
+  "MetaTrader5>=5.0.47",
+  "nest_asyncio>=1.6.0",
+  "openai>=2.0.0",
+  "pandas>=2.2.3",
+  "pydantic>=2.11.0",
+  "requests>=2.32.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.5",
+  "pytest-asyncio>=0.26.0",
+  "ruff>=0.11.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/information_arbitrage"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

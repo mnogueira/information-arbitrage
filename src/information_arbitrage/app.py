@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from contextlib import suppress
+from uuid import uuid4
+
+from information_arbitrage.collectors.google_trends import GoogleTrendsCollector
+from information_arbitrage.collectors.ib_news import IBNewsCollector
+from information_arbitrage.collectors.polymarket import PolymarketCollector
+from information_arbitrage.collectors.rss import RSSCollector
+from information_arbitrage.config import Settings
+from information_arbitrage.execution.ib import IBExecClient
+from information_arbitrage.execution.mt5 import MT5Client
+from information_arbitrage.execution.router import ExecutionRouter
+from information_arbitrage.instruments.registry import InstrumentRegistry
+from information_arbitrage.models import HeadlineEvent
+from information_arbitrage.monitor.storage import MarketStore
+from information_arbitrage.monitor.telegram import TelegramNotifier
+from information_arbitrage.scoring.engine import HeadlineScoringEngine
+from information_arbitrage.strategy.engine import StrategyEngine
+
+logger = logging.getLogger(__name__)
+
+
+async def _stop_after(duration_seconds: float, stop_event: asyncio.Event) -> None:
+    await asyncio.sleep(duration_seconds)
+    stop_event.set()
+
+
+class CollectorService:
+    def __init__(self, settings: Settings, store: MarketStore, registry: InstrumentRegistry) -> None:
+        self.settings = settings
+        self.store = store
+        self.registry = registry
+        self.collectors = [
+            IBNewsCollector(settings, registry),
+            RSSCollector(settings),
+            PolymarketCollector(settings),
+        ]
+        if settings.enable_google_trends_collector:
+            self.collectors.append(GoogleTrendsCollector())
+
+    async def run(self, duration_seconds: float | None = None) -> None:
+        stop_event = asyncio.Event()
+        timer = None
+        if duration_seconds is not None:
+            timer = asyncio.create_task(_stop_after(duration_seconds, stop_event))
+
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                for collector in self.collectors:
+                    task_group.create_task(collector.run(self.publish, stop_event))
+        finally:
+            if timer:
+                timer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await timer
+
+    async def publish(self, headline: HeadlineEvent) -> None:
+        inserted = self.store.insert_headline(headline)
+        if inserted:
+            logger.info("Headline ingested from %s: %s", headline.source, headline.text)
+
+
+class TraderService:
+    def __init__(
+        self,
+        settings: Settings,
+        store: MarketStore,
+        registry: InstrumentRegistry,
+    ) -> None:
+        self.settings = settings
+        self.store = store
+        self.registry = registry
+        self.scorer = HeadlineScoringEngine(settings, registry)
+        self.strategy = StrategyEngine(registry, settings.confidence_threshold)
+        self.router = ExecutionRouter(IBExecClient(settings), MT5Client(settings))
+        self.notifier = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+        self.consumer_id = f"trader-{uuid4()}"
+
+    async def run(self, duration_seconds: float | None = None) -> None:
+        stop_event = asyncio.Event()
+        timer = None
+        if duration_seconds is not None:
+            timer = asyncio.create_task(_stop_after(duration_seconds, stop_event))
+
+        try:
+            await self.router.connect()
+            while not stop_event.is_set():
+                headlines = self.store.claim_pending_headlines(
+                    consumer_id=self.consumer_id,
+                    limit=self.settings.headline_claim_batch_size,
+                )
+                if not headlines:
+                    try:
+                        await asyncio.wait_for(
+                            stop_event.wait(),
+                            timeout=self.settings.trader_poll_interval_seconds,
+                        )
+                    except TimeoutError:
+                        continue
+                    break
+
+                for headline in headlines:
+                    await self.process_headline(headline)
+        finally:
+            await self.router.disconnect()
+            if timer:
+                timer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await timer
+
+    async def process_headline(self, headline: HeadlineEvent) -> None:
+        try:
+            score = await self.scorer.score(headline)
+            self.store.record_score(score)
+
+            positions = await self.router.get_positions()
+            decisions = self.strategy.generate_trades(headline, score, positions)
+            self.store.record_trade_decisions(decisions)
+
+            for decision in decisions:
+                instrument = self.registry.resolve(decision.symbol)
+                if instrument is None:
+                    continue
+                report = await self.router.execute(decision, instrument)
+                self.store.record_execution(report)
+                if decision.confidence >= max(0.75, self.settings.confidence_threshold):
+                    await self.notifier.notify_trade(decision, report)
+
+            self.store.mark_headline_processed(headline.id)
+        except Exception as exc:
+            logger.exception("Failed to process headline %s", headline.id)
+            self.store.mark_headline_failed(headline.id, str(exc))
+
+
+class PipelineService:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.store = MarketStore(settings.db_path)
+        self.registry = InstrumentRegistry.default(settings)
+        self.collectors = CollectorService(settings, self.store, self.registry)
+        self.trader = TraderService(settings, self.store, self.registry)
+
+    async def run_collectors(self, duration_seconds: float | None = None) -> None:
+        await self.collectors.run(duration_seconds)
+
+    async def run_trader(self, duration_seconds: float | None = None) -> None:
+        await self.trader.run(duration_seconds)
+
+    async def run_all(self, duration_seconds: float | None = None) -> None:
+        async with asyncio.TaskGroup() as task_group:
+            task_group.create_task(self.collectors.run(duration_seconds))
+            task_group.create_task(self.trader.run(duration_seconds))
